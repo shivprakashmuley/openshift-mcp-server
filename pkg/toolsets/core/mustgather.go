@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"path"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 )
@@ -25,9 +25,8 @@ const (
 	defaultGatherSourceDir = "/must-gather/"
 	defaultMustGatherImage = "registry.redhat.io/openshift4/ose-must-gather:latest"
 	defaultGatherCmd       = "/usr/bin/gather"
-	// annotation to look for in ClusterServiceVersions and ClusterOperators when using --all-images
-	mgAnnotation         = "operators.openshift.io/must-gather-image"
-	maxConcurrentGathers = 8
+	mgAnnotation           = "operators.openshift.io/must-gather-image"
+	maxConcurrentGathers   = 8
 )
 
 func initMustGatherPlan(o internalk8s.Openshift) []api.ServerTool {
@@ -133,7 +132,7 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		sourceDir = path.Clean(args["source_dir"].(string))
 	}
 
-	namespace = fmt.Sprintf("openshift-must-gather-%s", generateRandomString(6))
+	namespace = fmt.Sprintf("openshift-must-gather-%s", rand.String(6))
 	if args["namespace"] != nil {
 		namespace = args["namespace"].(string)
 	}
@@ -152,7 +151,13 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	}
 
 	if args["images"] != nil {
-		images = args["images"].([]string)
+		if imagesArg, ok := args["images"].([]interface{}); ok {
+			for _, img := range imagesArg {
+				if imgStr, ok := img.(string); ok {
+					images = append(images, imgStr)
+				}
+			}
+		}
 	}
 
 	if allImages {
@@ -216,8 +221,13 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		},
 	}
 
-	gatherContainers := make([]corev1.Container, 1)
-	gatherContainers[0] = *gatherContainerTemplate.DeepCopy()
+	var gatherContainers = []corev1.Container{
+		*gatherContainerTemplate.DeepCopy(),
+	}
+
+	if len(images) > 0 {
+		gatherContainers = make([]corev1.Container, len(images))
+	}
 
 	for i, image := range images {
 		gatherContainers[i] = *gatherContainerTemplate.DeepCopy()
@@ -272,28 +282,15 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		},
 	}
 
-	nsList, err := params.NamespacesList(params, internalk8s.ResourceListOptions{})
-	if err != nil {
-		return api.NewToolCallResult("", fmt.Errorf("failed to list namespaces: %v", err)), nil
-	}
-
 	namespaceExists := false
-	if err := nsList.EachListItem(func(obj runtime.Object) error {
-		if !namespaceExists {
-			unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-			if err != nil {
-				return err
-			}
 
-			u := unstructured.Unstructured{Object: unstruct}
-			if u.GetName() == namespace {
-				namespaceExists = true
-			}
-		}
-
-		return nil
-	}); err != nil {
-		return api.NewToolCallResult("", fmt.Errorf("failed to check namespaces list: %v", err)), nil
+	_, err := params.ResourcesGet(params, &schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Namespaces",
+	}, "", namespace)
+	if err != nil {
+		namespaceExists = true
 	}
 
 	var namespaceObj *corev1.Namespace
@@ -320,7 +317,7 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		},
 	}
 
-	clusterRoleBindingName := fmt.Sprintf("must-gather-collector-%s", namespace)
+	clusterRoleBindingName := fmt.Sprintf("%s-must-gather-collector", namespace)
 	clusterRoleBinding := &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -433,21 +430,12 @@ func getComponentImages(params api.ToolHandlerParams) ([]string, error) {
 	return images, err
 }
 
-func generateRandomString(length int) string {
-	r := strings.ToLower(rand.Text())
-	if length > len(r) {
-		r = r + generateRandomString(length-len(r))
-	}
-
-	return r[:length]
-}
-
 func parseNodeSelector(selector string) map[string]string {
 	result := make(map[string]string)
 	pairs := strings.Split(selector, ",")
 	for _, pair := range pairs {
 		kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
-		if len(kv) == 2 {
+		if len(kv) == 2 && strings.TrimSpace(kv[0]) != "" {
 			result[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 		}
 	}
