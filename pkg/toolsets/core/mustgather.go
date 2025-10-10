@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/yaml"
 )
@@ -25,7 +26,8 @@ const (
 	defaultMustGatherImage = "registry.redhat.io/openshift4/ose-must-gather:latest"
 	defaultGatherCmd       = "/usr/bin/gather"
 	// annotation to look for in ClusterServiceVersions and ClusterOperators when using --all-images
-	mgAnnotation = "operators.openshift.io/must-gather-image"
+	mgAnnotation         = "operators.openshift.io/must-gather-image"
+	maxConcurrentGathers = 8
 )
 
 func initMustGatherPlan(o internalk8s.Openshift) []api.ServerTool {
@@ -153,6 +155,23 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		images = args["images"].([]string)
 	}
 
+	if allImages {
+		componentImages, err := getComponentImages(params)
+		if err != nil {
+			return api.NewToolCallResult("",
+				fmt.Errorf("failed to get operator images: %v", err),
+			), nil
+		}
+
+		images = append(images, componentImages...)
+	}
+
+	if len(images) > maxConcurrentGathers {
+		return api.NewToolCallResult("",
+			fmt.Errorf("more than %d gather images are not supported", maxConcurrentGathers),
+		), nil
+	}
+
 	if args["timeout"] != nil {
 		timeout = args["timeout"].(string)
 
@@ -181,6 +200,8 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		})
 	}
 
+	// template container for gather,
+	// if multiple images are added multiple containers in the same pod will be spin up
 	gatherContainerTemplate := corev1.Container{
 		Name:            "gather",
 		Image:           defaultMustGatherImage,
@@ -189,7 +210,7 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 		Env:             envVars,
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      "must-gather-collection",
+				Name:      "must-gather-output",
 				MountPath: sourceDir,
 			},
 		},
@@ -197,16 +218,16 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 
 	gatherContainers := make([]corev1.Container, 1)
 	gatherContainers[0] = *gatherContainerTemplate.DeepCopy()
+
 	for i, image := range images {
 		gatherContainers[i] = *gatherContainerTemplate.DeepCopy()
-		gatherContainers[i].Image = image
-	}
 
-	if allImages {
-		// TODO: list each ClusterOperator object and check for mgAnnotation
-		// TODO: list each ClusterServiceVersion object (OLM operators) and check for mgAnnotation
-		_ = allImages
-		_ = mgAnnotation
+		// if more than one gather container(s) are added,
+		// suffix container name with int id
+		if len(images) > 1 {
+			gatherContainers[i].Name = fmt.Sprintf("gather-%d", i+1)
+		}
+		gatherContainers[i].Image = image
 	}
 
 	serviceAccountName := "must-gather-collector"
@@ -223,7 +244,7 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 			RestartPolicy:      corev1.RestartPolicyNever,
 			Volumes: []corev1.Volume{
 				{
-					Name: "must-gather-collection",
+					Name: "must-gather-output",
 					VolumeSource: corev1.VolumeSource{
 						EmptyDir: &corev1.EmptyDirVolumeSource{},
 					},
@@ -236,7 +257,7 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 				Command:         []string{"/bin/bash", "-c", "sleep infinity"},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      "must-gather-collection",
+						Name:      "must-gather-output",
 						MountPath: "/must-gather",
 					},
 				},
@@ -367,6 +388,49 @@ func mustGatherPlan(params api.ToolHandlerParams) (*api.ToolCallResult, error) {
 	result.WriteString("```")
 
 	return api.NewToolCallResult(result.String(), nil), nil
+}
+
+func getComponentImages(params api.ToolHandlerParams) ([]string, error) {
+	var images []string
+	appendImageFromAnnotation := func(obj runtime.Object) error {
+		unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+		if err != nil {
+			return err
+		}
+
+		u := unstructured.Unstructured{Object: unstruct}
+		annotations := u.GetAnnotations()
+		if annotations[mgAnnotation] != "" {
+			images = append(images, annotations[mgAnnotation])
+		}
+
+		return nil
+	}
+
+	clusterOperatorsList, err := params.ResourcesList(params, &schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "ClusterOperator",
+	}, "", internalk8s.ResourceListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := clusterOperatorsList.EachListItem(appendImageFromAnnotation); err != nil {
+		return images, err
+	}
+
+	csvList, err := params.ResourcesList(params, &schema.GroupVersionKind{
+		Group:   "operators.coreos.com",
+		Version: "v1alpha1",
+		Kind:    "ClusterServiceVersion",
+	}, "", internalk8s.ResourceListOptions{})
+	if err != nil {
+		return images, err
+	}
+
+	err = csvList.EachListItem(appendImageFromAnnotation)
+	return images, err
 }
 
 func generateRandomString(length int) string {
